@@ -23,6 +23,8 @@ import sys
 from pathlib import Path
 
 os.environ.setdefault("SPCONV_ALGO", "native")
+# Reduces allocator fragmentation when peak VRAM is tight (e.g. 11-view VGGT on 11GB).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 from PIL import Image
@@ -77,6 +79,23 @@ def collect_paths_from_view_subdirs(views_root: str, frame_name: str) -> list[st
             )
         paths.append(str(f.resolve()))
     return paths
+
+
+def offload_to_cpu_for_low_vram(pipeline: TrellisVGGTTo3DPipeline) -> None:
+    """
+    from_pretrained loads VGGT, BiRefNet, DreamSim, and Trellis weights onto GPU.
+    For 11-view VGGT, that leaves almost no room before aggregator forward.
+    Move everything to CPU first; keep BiRefNet on GPU only during preprocess, then CPU again before run().
+    """
+    pipeline.VGGT_model.cpu()
+    if getattr(pipeline, "dreamsim_model", None) is not None:
+        pipeline.dreamsim_model.cpu()
+    for model in pipeline.models.values():
+        model.cpu()
+    pipeline.birefnet_model.cpu()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
 
 def load_and_preprocess(
@@ -141,6 +160,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Keep major models on GPU (faster, needs more VRAM). Default is low-VRAM mode like app.py.",
     )
+    p.add_argument(
+        "--cuda_device",
+        type=int,
+        default=None,
+        metavar="N",
+        help="CUDA device index (e.g. 1 on a multi-GPU box). Default: current device / 0.",
+    )
 
     # Stage 1 (sparse structure) — defaults match app.py sliders
     p.add_argument("--ss_steps", type=int, default=30)
@@ -186,10 +212,12 @@ def main() -> None:
     if len(paths) != 11:
         print(f"[infer] note: {len(paths)} views loaded; use subfolder names to control order.")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type != "cuda":
+    if not torch.cuda.is_available():
         print("CUDA is required for this pipeline.", file=sys.stderr)
         sys.exit(1)
+    if args.cuda_device is not None:
+        torch.cuda.set_device(args.cuda_device)
+    device = torch.device(f"cuda:{args.cuda_device}" if args.cuda_device is not None else "cuda")
 
     print(f"[infer] loading pipeline: {args.pretrained}")
     pipeline = TrellisVGGTTo3DPipeline.from_pretrained(args.pretrained)
@@ -197,15 +225,25 @@ def main() -> None:
     pipeline.low_vram = low_vram
 
     if low_vram:
+        print("[infer] low VRAM: moving Trellis / VGGT / DreamSim / BiRefNet off GPU, then BiRefNet only for preprocess")
+        offload_to_cpu_for_low_vram(pipeline)
         pipeline.birefnet_model.to(device)
     else:
         for model in pipeline.models.values():
             model.to(device)
         pipeline.VGGT_model.to(device)
+        if getattr(pipeline, "dreamsim_model", None) is not None:
+            pipeline.dreamsim_model.to(device)
         pipeline.birefnet_model.to(device)
 
     print("[infer] preprocessing (BiRefNet / crop, same as demo)")
     image_files = load_and_preprocess(paths, pipeline)
+
+    if low_vram:
+        pipeline.birefnet_model.cpu()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        print("[infer] BiRefNet off GPU; freed memory for VGGT (11 views)")
 
     sparse_structure_sampler_params = {
         "steps": args.ss_steps,
