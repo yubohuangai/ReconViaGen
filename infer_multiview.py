@@ -269,6 +269,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mesh_simplify", type=float, default=0.95)
     p.add_argument("--texture_size", type=int, default=1024, choices=(512, 1024, 2048))
     p.add_argument("--save_ply", action="store_true", help="Also save Gaussian PLY (can be large).")
+    p.add_argument(
+        "--no_fill_holes",
+        action="store_true",
+        help=(
+            "Skip nvdiffrast-based invisible-face removal in GLB postprocess. "
+            "Use if you see nvdiffrast CUDA errors (e.g. error 209 on Turing or after multi-GPU VGGT)."
+        ),
+    )
 
     p.add_argument(
         "--max_views",
@@ -425,13 +433,42 @@ def main() -> None:
     gs = outputs["gaussian"][0]
     mesh = outputs["mesh"][0]
     del outputs
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
     glb_path = out_dir / "mesh.glb"
     print(f"[infer] exporting GLB -> {glb_path}")
-    glb = postprocessing_utils.to_glb(
-        gs, mesh, simplify=args.mesh_simplify, texture_size=args.texture_size, verbose=True
-    )
+    if args.no_fill_holes:
+        print("[infer] fill_holes disabled (--no_fill_holes)", flush=True)
+    want_fill = not args.no_fill_holes
+
+    def _export_glb(fill_holes: bool):
+        return postprocessing_utils.to_glb(
+            gs,
+            mesh,
+            simplify=args.mesh_simplify,
+            texture_size=args.texture_size,
+            verbose=True,
+            fill_holes=fill_holes,
+        )
+
+    try:
+        glb = _export_glb(want_fill)
+    except RuntimeError as e:
+        err = str(e).lower()
+        if want_fill and ("cuda" in err or "nvdiffrast" in err or "rasterize" in err):
+            print(
+                "[infer] GLB export failed in nvdiffrast hole-fill step; retrying with fill_holes=False. "
+                "Use --no_fill_holes to skip this step explicitly.",
+                flush=True,
+            )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            glb = _export_glb(False)
+        else:
+            raise
     glb.export(str(glb_path))
 
     if args.save_ply:
