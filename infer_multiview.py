@@ -20,6 +20,8 @@ Example:
   All views on multiple GPUs (shard VGGT.aggregator):
   pip install accelerate
   python infer_multiview.py --vggt_gpus 0,1,2 --views_root ... --out_dir ...
+
+  On Turing/Pascal, nvdiffrast mesh hole-fill is skipped by default (CUDA error 209); use --fill_holes to try.
 """
 from __future__ import annotations
 
@@ -271,13 +273,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--texture_render_resolution",
         type=int,
-        default=1024,
+        default=512,
         help="Gaussian splat render resolution per view when baking GLB texture (lower if export OOMs).",
     )
     p.add_argument(
         "--texture_views",
         type=int,
-        default=100,
+        default=48,
         help="Number of views around the object for GLB texture baking.",
     )
     p.add_argument(
@@ -288,6 +290,15 @@ def parse_args() -> argparse.Namespace:
         help="Supersampling during texture bake; >1 multiplies effective resolution and VRAM (default 1).",
     )
     p.add_argument("--save_ply", action="store_true", help="Also save Gaussian PLY (can be large).")
+    p.add_argument(
+        "--fill_holes",
+        action="store_true",
+        help=(
+            "Run nvdiffrast invisible-face removal on export. On Ampere+ (sm_80+) this is the default "
+            "unless --no_fill_holes. On Turing/Pascal, it is off by default (CUDA error 209 is common); "
+            "pass this flag to try anyway."
+        ),
+    )
     p.add_argument(
         "--no_fill_holes",
         action="store_true",
@@ -458,9 +469,21 @@ def main() -> None:
 
     glb_path = out_dir / "mesh.glb"
     print(f"[infer] exporting GLB -> {glb_path}")
+    if args.no_fill_holes and args.fill_holes:
+        print("[infer] both --fill_holes and --no_fill_holes set; honoring --no_fill_holes", flush=True)
+    dev_idx = args.cuda_device if args.cuda_device is not None else torch.cuda.current_device()
+    cap_major = torch.cuda.get_device_capability(dev_idx)[0]
+    # nvdiffrast hole-fill often hits CUDA 209 on pre-Ampere; that error poisons the context and
+    # later Gaussian bakes can fail with bogus allocations — default off on sm < 80.
+    want_fill = (not args.no_fill_holes) and (cap_major >= 8 or args.fill_holes)
     if args.no_fill_holes:
         print("[infer] fill_holes disabled (--no_fill_holes)", flush=True)
-    want_fill = not args.no_fill_holes
+    elif cap_major < 8 and not args.fill_holes:
+        print(
+            "[infer] pre-Ampere GPU: skipping nvdiffrast fill_holes by default (CUDA error 209 is common). "
+            "Use --fill_holes to try anyway.",
+            flush=True,
+        )
 
     def _export_glb(fill_holes: bool):
         return postprocessing_utils.to_glb(
@@ -482,11 +505,15 @@ def main() -> None:
         if want_fill and ("cuda" in err or "nvdiffrast" in err or "rasterize" in err):
             print(
                 "[infer] GLB export failed in nvdiffrast hole-fill step; retrying with fill_holes=False. "
-                "Use --no_fill_holes to skip this step explicitly.",
+                "If the retry also fails, exit and re-run with --no_fill_holes (CUDA may stay in an error state).",
                 flush=True,
             )
             if torch.cuda.is_available():
-                torch.cuda.synchronize()
+                for di in range(torch.cuda.device_count()):
+                    try:
+                        torch.cuda.synchronize(di)
+                    except RuntimeError:
+                        pass
                 torch.cuda.empty_cache()
             glb = _export_glb(False)
         else:

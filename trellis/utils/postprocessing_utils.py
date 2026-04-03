@@ -18,6 +18,23 @@ from ..renderers import GaussianRenderer
 from ..representations import Gaussian, MeshExtractResult
 
 
+def _align_gaussian_cuda_device(gs: Gaussian) -> None:
+    """Ensure all Gaussian tensors (including bias buffers from setup_functions) share _xyz's CUDA device."""
+    if gs._xyz is None:
+        return
+    d = gs._xyz.device
+    if d.type != "cuda":
+        return
+    gs.aabb = gs.aabb.to(d)
+    gs.scale_bias = gs.scale_bias.to(d)
+    gs.rots_bias = gs.rots_bias.to(d)
+    gs.opacity_bias = gs.opacity_bias.to(d)
+    for attr in ("_xyz", "_features_dc", "_features_rest", "_scaling", "_rotation", "_opacity"):
+        t = getattr(gs, attr, None)
+        if t is not None and t.device != d:
+            setattr(gs, attr, t.to(d))
+
+
 @torch.no_grad()
 def _fill_holes(
     verts,
@@ -446,6 +463,7 @@ def to_glb(
     vertices, faces, uvs = parametrize_mesh(vertices, faces)
 
     # bake texture
+    _align_gaussian_cuda_device(app_rep)
     observations, extrinsics, intrinsics = render_multiview(
         app_rep,
         resolution=texture_render_resolution,
