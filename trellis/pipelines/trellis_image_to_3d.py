@@ -602,22 +602,40 @@ class TrellisImageTo3DPipeline(Pipeline):
         """
         ret = {}
         ret['slat'] = slat
-        if 'gaussian' in formats:
-            if getattr(self, 'low_vram', False):
-                self.models['slat_decoder_gs'].to(self.device)
-            ret['gaussian'] = self.models['slat_decoder_gs'](slat)
-            if getattr(self, 'low_vram', False):
-                self.models['slat_decoder_gs'].cpu()
-                torch.cuda.empty_cache()
-        if 'mesh' in formats:
-            if getattr(self, 'low_vram', False):
-                self.models['slat_decoder_mesh'].to(self.device)
-            ret['mesh'] = self.models['slat_decoder_mesh'](slat)
-            if getattr(self, 'low_vram', False):
-                self.models['slat_decoder_mesh'].cpu()
-                torch.cuda.empty_cache()
-        if 'radiance_field' in formats:
-            ret['radiance_field'] = self.models['slat_decoder_rf'](slat)
+        # Decode order: when both mesh and gaussian are requested in low_vram, run mesh first.
+        # Otherwise Gaussian tensors stay on GPU during the heavier mesh extraction and can OOM on ~11GB GPUs.
+        fmts = list(formats)
+        if getattr(self, 'low_vram', False) and 'gaussian' in fmts and 'mesh' in fmts:
+            fmts = [f for f in fmts if f not in ('gaussian', 'mesh')]
+            fmts.extend(['mesh', 'gaussian'])
+
+        for fmt in fmts:
+            if fmt == 'gaussian':
+                if getattr(self, 'low_vram', False):
+                    self.models['slat_decoder_gs'].to(self.device)
+                ret['gaussian'] = self.models['slat_decoder_gs'](slat)
+                if getattr(self, 'low_vram', False):
+                    self.models['slat_decoder_gs'].cpu()
+                    torch.cuda.empty_cache()
+            elif fmt == 'mesh':
+                if getattr(self, 'low_vram', False):
+                    self.models['slat_decoder_mesh'].to(self.device)
+                ret['mesh'] = self.models['slat_decoder_mesh'](slat)
+                if getattr(self, 'low_vram', False):
+                    self.models['slat_decoder_mesh'].cpu()
+                    torch.cuda.empty_cache()
+                # to_glb only needs vertices/faces; move off GPU before Gaussian decode to save VRAM
+                if getattr(self, 'low_vram', False) and 'gaussian' in fmts:
+                    try:
+                        if fmts.index('gaussian') > fmts.index('mesh'):
+                            for m in ret['mesh']:
+                                m.vertices = m.vertices.detach().cpu()
+                                m.faces = m.faces.detach().cpu()
+                            torch.cuda.empty_cache()
+                    except ValueError:
+                        pass
+            elif fmt == 'radiance_field':
+                ret['radiance_field'] = self.models['slat_decoder_rf'](slat)
         return ret
     
     def sample_slat(
