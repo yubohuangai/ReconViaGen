@@ -468,4 +468,4 @@ if __name__ == "__main__":
     pipeline._device = torch.device('cuda')
     pipeline.low_vram = True   # default; updated per-request from UI
     pipeline.birefnet_model.cuda()  # small model, keep on GPU permanently
-    demo.launch()
+    demo.launch(server_name="0.0.0.0", server_port=7860, inbrowser=False)

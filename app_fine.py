@@ -881,4 +881,4 @@ if __name__ == "__main__":
     pipeline.low_vram = True   # default; updated per-request from UI
     pipeline.birefnet_model.cuda()  # small model, keep on GPU permanently
     mast3r_model = AsymmetricMASt3R.from_pretrained("naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric").eval()
-    demo.launch()
+    demo.launch(server_name="0.0.0.0", server_port=7860, inbrowser=False)

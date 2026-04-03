@@ -218,4 +218,5 @@ fi
 if [ "$DEMO" = true ] ; then
     pip install gradio==4.44.1 gradio_litmodel3d==0.0.1
     pip install pydantic==2.10.6
+    pip install "starlette<1.0"
 fi
