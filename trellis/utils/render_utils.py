@@ -205,6 +205,10 @@ def render_ortho_video(sample, resolution=512, ssaa=4, bg_color=(0, 0, 0), num_f
 
 
 def render_multiview(sample, resolution=518, ssaa=4, bg_color=(0, 0, 0), num_frames=30, r = 2, fov = 40, random_offset=False, only_color=False, **kwargs):
+    # Back-compat: callers (e.g. to_glb) historically passed nviews=...; only num_frames is defined here.
+    nviews = kwargs.pop("nviews", None)
+    if nviews is not None:
+        num_frames = int(nviews)
     if random_offset:
         yaws = []
         pitchs = []

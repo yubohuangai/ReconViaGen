@@ -403,6 +403,9 @@ def to_glb(
     fill_holes: bool = True,
     fill_holes_max_size: float = 0.04,
     texture_size: int = 1024,
+    texture_render_resolution: int = 1024,
+    texture_num_frames: int = 100,
+    texture_ssaa: int = 1,
     debug: bool = False,
     verbose: bool = True,
 ) -> trimesh.Trimesh:
@@ -416,6 +419,9 @@ def to_glb(
         fill_holes (bool): Whether to fill holes in the mesh.
         fill_holes_max_size (float): Maximum area of a hole to fill.
         texture_size (int): Size of the texture.
+        texture_render_resolution (int): Resolution per view when rendering the Gaussian for baking.
+        texture_num_frames (int): Number of views around the object for texture baking.
+        texture_ssaa (int): Supersampling factor for those renders; use 1 on tight VRAM (4× blows up memory).
         debug (bool): Whether to print debug information.
         verbose (bool): Whether to print progress.
     """
@@ -440,7 +446,13 @@ def to_glb(
     vertices, faces, uvs = parametrize_mesh(vertices, faces)
 
     # bake texture
-    observations, extrinsics, intrinsics = render_multiview(app_rep, resolution=1024, nviews=100, only_color=True)
+    observations, extrinsics, intrinsics = render_multiview(
+        app_rep,
+        resolution=texture_render_resolution,
+        ssaa=texture_ssaa,
+        num_frames=texture_num_frames,
+        only_color=True,
+    )
     masks = [np.any(observation > 0, axis=-1) for observation in observations]
     extrinsics = [extrinsics[i].cpu().numpy() for i in range(len(extrinsics))]
     intrinsics = [intrinsics[i].cpu().numpy() for i in range(len(intrinsics))]
@@ -481,7 +493,9 @@ def simplify_gs(
         return gs
     
     # simplify
-    observations, extrinsics, intrinsics = render_multiview(gs, resolution=1024, nviews=100, only_color=True)
+    observations, extrinsics, intrinsics = render_multiview(
+        gs, resolution=1024, ssaa=1, num_frames=100, only_color=True
+    )
     observations = [torch.tensor(obs / 255.0).float().cuda().permute(2, 0, 1) for obs in observations]
     
     # Following https://arxiv.org/pdf/2411.06019

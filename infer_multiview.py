@@ -268,6 +268,25 @@ def parse_args() -> argparse.Namespace:
     # Export
     p.add_argument("--mesh_simplify", type=float, default=0.95)
     p.add_argument("--texture_size", type=int, default=1024, choices=(512, 1024, 2048))
+    p.add_argument(
+        "--texture_render_resolution",
+        type=int,
+        default=1024,
+        help="Gaussian splat render resolution per view when baking GLB texture (lower if export OOMs).",
+    )
+    p.add_argument(
+        "--texture_views",
+        type=int,
+        default=100,
+        help="Number of views around the object for GLB texture baking.",
+    )
+    p.add_argument(
+        "--texture_ssaa",
+        type=int,
+        default=1,
+        choices=(1, 2, 4),
+        help="Supersampling during texture bake; >1 multiplies effective resolution and VRAM (default 1).",
+    )
     p.add_argument("--save_ply", action="store_true", help="Also save Gaussian PLY (can be large).")
     p.add_argument(
         "--no_fill_holes",
@@ -449,6 +468,9 @@ def main() -> None:
             mesh,
             simplify=args.mesh_simplify,
             texture_size=args.texture_size,
+            texture_render_resolution=args.texture_render_resolution,
+            texture_num_frames=args.texture_views,
+            texture_ssaa=args.texture_ssaa,
             verbose=True,
             fill_holes=fill_holes,
         )
