@@ -973,27 +973,33 @@ class TrellisVGGTTo3DPipeline(TrellisImageTo3DPipeline):
         Returns:
             torch.Tensor: The encoded features.
         """
+        vggt_multi = getattr(self, '_vggt_multi_gpu', False)
+        vggt_in = getattr(self, '_vggt_input_device', self.device)
+
         if isinstance(image, torch.Tensor):
             assert image.ndim == 4, "Image tensor should be batched (B, C, H, W)"
             image = F.interpolate(image, self.default_image_resolution, mode='bilinear', align_corners=False)
+            image = image.to(vggt_in if vggt_multi else self.device)
         elif isinstance(image, list):
             assert all(isinstance(i, Image.Image) for i in image), "Image list should be list of PIL images"
             image = [i.resize((self.default_image_resolution, self.default_image_resolution), Image.LANCZOS) for i in image]
             image = [np.array(i.convert('RGB')).astype(np.float32) / 255 for i in image]
             image = [torch.from_numpy(i).permute(2, 0, 1).float() for i in image]
-            image = torch.stack(image).to(self.device)
+            image = torch.stack(image).to(vggt_in if vggt_multi else self.device)
         else:
             raise ValueError(f"Unsupported type of image: {type(image)}")
-        
-        if self.low_vram:
-            self.VGGT_model.to(self.device)
+
         with torch.no_grad():
             with torch.cuda.amp.autocast(dtype=self.VGGT_dtype):
-                # Predict attributes including cameras, depth maps, and point maps.
-                aggregated_tokens_list, _ = self.VGGT_model.aggregator(image[None])
-        if self.low_vram:
-            self.VGGT_model.cpu()
-            torch.cuda.empty_cache()
+                if vggt_multi:
+                    aggregated_tokens_list, _ = self.VGGT_model.aggregator(image[None])
+                else:
+                    if self.low_vram:
+                        self.VGGT_model.to(self.device)
+                    aggregated_tokens_list, _ = self.VGGT_model.aggregator(image[None])
+                    if self.low_vram:
+                        self.VGGT_model.cpu()
+                        torch.cuda.empty_cache()
 
         return aggregated_tokens_list, image
 

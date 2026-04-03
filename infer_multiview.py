@@ -13,14 +13,24 @@ Example:
 
   python infer_multiview.py --views_root /mnt/yubo/obj/cube/images --out_dir ./out_cube
   # expects .../images/01/000000.jpg, .../02/000000.jpg, ... (one frame per view subfolder)
+
+  VGGT global attention scales with the number of views; on ~11GB GPUs use fewer views or
+  --max_views 6 (or rely on automatic subsampling). See --use_all_views for full 11+.
+
+  All views on multiple GPUs (shard VGGT.aggregator):
+  pip install accelerate
+  python infer_multiview.py --vggt_gpus 0,1,2 --views_root ... --out_dir ...
 """
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 import re
 import sys
 from pathlib import Path
+
+import numpy as np
 
 os.environ.setdefault("SPCONV_ALGO", "native")
 # Reduces allocator fragmentation when peak VRAM is tight (e.g. 11-view VGGT on 11GB).
@@ -81,13 +91,46 @@ def collect_paths_from_view_subdirs(views_root: str, frame_name: str) -> list[st
     return paths
 
 
-def offload_to_cpu_for_low_vram(pipeline: TrellisVGGTTo3DPipeline) -> None:
+def vram_suggested_max_views(total_bytes: int) -> int | None:
+    """
+    VGGT global blocks attend over S*P tokens (all views × patches), so VRAM grows
+    quickly with view count. Rough caps for stable inference:
+    """
+    gb = total_bytes / (1024**3)
+    if gb < 12:
+        return 6
+    if gb < 15:
+        return 8
+    if gb < 20:
+        return 12
+    return None
+
+
+def subsample_paths_even(paths: list[str], k: int) -> list[str]:
+    """Evenly pick k paths from ordered list (spread across azimuth / indices)."""
+    n = len(paths)
+    if k >= n:
+        return paths
+    if k <= 0:
+        return paths
+    if k == 1:
+        return [paths[0]]
+    idx = np.unique(np.linspace(0, n - 1, k, dtype=np.int64))
+    return [paths[int(i)] for i in idx]
+
+
+def offload_to_cpu_for_low_vram(
+    pipeline: TrellisVGGTTo3DPipeline,
+    *,
+    include_vggt: bool = True,
+) -> None:
     """
     from_pretrained loads VGGT, BiRefNet, DreamSim, and Trellis weights onto GPU.
-    For 11-view VGGT, that leaves almost no room before aggregator forward.
-    Move everything to CPU first; keep BiRefNet on GPU only during preprocess, then CPU again before run().
+    Move most weights to CPU before heavy forward. If include_vggt=False (multi-GPU VGGT path),
+    VGGT is left on GPU until dispatch_vggt_aggregator_sharded runs.
     """
-    pipeline.VGGT_model.cpu()
+    if include_vggt:
+        pipeline.VGGT_model.cpu()
     if getattr(pipeline, "dreamsim_model", None) is not None:
         pipeline.dreamsim_model.cpu()
     for model in pipeline.models.values():
@@ -96,6 +139,48 @@ def offload_to_cpu_for_low_vram(pipeline: TrellisVGGTTo3DPipeline) -> None:
     if torch.cuda.is_available():
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
+
+
+def dispatch_vggt_aggregator_sharded(
+    pipeline: TrellisVGGTTo3DPipeline,
+    gpu_ids: list[int],
+) -> None:
+    """
+    Shard only VGGT.aggregator across GPUs (Accelerate device_map) so all 11 views fit.
+    Requires: pip install accelerate
+    """
+    try:
+        from accelerate import dispatch_model, infer_auto_device_map
+    except ImportError as e:
+        raise RuntimeError(
+            "Multi-GPU VGGT requires the `accelerate` package: pip install accelerate"
+        ) from e
+
+    for i in gpu_ids:
+        if i < 0 or i >= torch.cuda.device_count():
+            raise ValueError(f"Invalid GPU id {i}; only {torch.cuda.device_count()} CUDA device(s) visible.")
+
+    # aggregator-only forward; drop unused heads to shrink the sharded module
+    for name in ("camera_head", "point_head"):
+        if hasattr(pipeline.VGGT_model, name):
+            setattr(pipeline.VGGT_model, name, None)
+
+    pipeline.VGGT_model.cpu()
+    torch.cuda.empty_cache()
+
+    agg = pipeline.VGGT_model.aggregator
+    dt = next(agg.parameters()).dtype
+    max_memory = {
+        i: f"{int(torch.cuda.get_device_properties(i).total_memory / 1024**3 * 0.88)}GiB" for i in gpu_ids
+    }
+    device_map = infer_auto_device_map(agg, max_memory=max_memory, dtype=dt)
+    pipeline.VGGT_model.aggregator = dispatch_model(agg, device_map=device_map)
+    pipeline._vggt_multi_gpu = True
+    pipeline._vggt_input_device = next(pipeline.VGGT_model.aggregator.parameters()).device
+    print(
+        f"[infer] VGGT aggregator sharded across GPUs {gpu_ids}; input device {pipeline._vggt_input_device}",
+        flush=True,
+    )
 
 
 def load_and_preprocess(
@@ -185,12 +270,42 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--texture_size", type=int, default=1024, choices=(512, 1024, 2048))
     p.add_argument("--save_ply", action="store_true", help="Also save Gaussian PLY (can be large).")
 
+    p.add_argument(
+        "--max_views",
+        type=int,
+        default=None,
+        metavar="K",
+        help="Use only K views (evenly sampled from your list). Needed on ~11GB GPUs for VGGT.",
+    )
+    p.add_argument(
+        "--use_all_views",
+        action="store_true",
+        help="Do not auto-cap views by GPU VRAM (may OOM on consumer GPUs).",
+    )
+    p.add_argument(
+        "--vggt_gpus",
+        type=str,
+        default=None,
+        metavar="IDS",
+        help=(
+            "Comma-separated GPU indices to shard VGGT.aggregator across (e.g. 0,1,2). "
+            "Use with all 11 views on multi-GPU nodes; requires: pip install accelerate"
+        ),
+    )
+
     return p.parse_args()
+
+
+def _parse_vggt_gpu_ids(s: str | None) -> list[int] | None:
+    if not s or not str(s).strip():
+        return None
+    return [int(x.strip()) for x in str(s).split(",") if x.strip()]
 
 
 def main() -> None:
     args = parse_args()
     low_vram = not args.no_low_vram
+    vggt_gpu_ids = _parse_vggt_gpu_ids(args.vggt_gpus)
 
     if args.images:
         paths = list(args.images)
@@ -206,12 +321,6 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[infer] {len(paths)} views (in order):")
-    for i, pth in enumerate(paths):
-        print(f"  {i:02d}  {pth}")
-    if len(paths) != 11:
-        print(f"[infer] note: {len(paths)} views loaded; use subfolder names to control order.")
-
     if not torch.cuda.is_available():
         print("CUDA is required for this pipeline.", file=sys.stderr)
         sys.exit(1)
@@ -219,12 +328,50 @@ def main() -> None:
         torch.cuda.set_device(args.cuda_device)
     device = torch.device(f"cuda:{args.cuda_device}" if args.cuda_device is not None else "cuda")
 
+    n_full = len(paths)
+    vram_cap = vram_suggested_max_views(torch.cuda.get_device_properties(device).total_memory)
+    if args.max_views is not None:
+        paths = subsample_paths_even(paths, min(args.max_views, n_full))
+    elif vggt_gpu_ids is not None:
+        pass
+    elif not args.use_all_views and vram_cap is not None and n_full > vram_cap:
+        paths = subsample_paths_even(paths, vram_cap)
+        print(
+            f"[infer] VRAM cap: using {len(paths)}/{n_full} views (evenly sampled). "
+            f"GPU suggests ≤{vram_cap} views for VGGT global attention on this device. "
+            f"Pass --use_all_views to force all {n_full} views (needs more VRAM), or --max_views K to choose K.",
+            flush=True,
+        )
+
+    print(f"[infer] {len(paths)} views (in order):")
+    for i, pth in enumerate(paths):
+        print(f"  {i:02d}  {pth}")
+    if len(paths) != n_full:
+        print(f"[infer] note: subsampled from {n_full} paths.")
+
+    try:
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+    except Exception:
+        pass
+
     print(f"[infer] loading pipeline: {args.pretrained}")
     pipeline = TrellisVGGTTo3DPipeline.from_pretrained(args.pretrained)
     pipeline._device = device
     pipeline.low_vram = low_vram
 
-    if low_vram:
+    if vggt_gpu_ids is not None:
+        print(
+            "[infer] multi-GPU VGGT: Trellis/DreamSim on CPU; BiRefNet on GPU for preprocess only; "
+            "VGGT.aggregator sharded via Accelerate",
+            flush=True,
+        )
+        if args.no_low_vram:
+            print("[infer] note: --no_low_vram is ignored when --vggt_gpus is set (Trellis stays CPU-offloaded).", flush=True)
+        offload_to_cpu_for_low_vram(pipeline, include_vggt=False)
+        dispatch_vggt_aggregator_sharded(pipeline, vggt_gpu_ids)
+        pipeline.birefnet_model.to(device)
+    elif low_vram:
         print("[infer] low VRAM: moving Trellis / VGGT / DreamSim / BiRefNet off GPU, then BiRefNet only for preprocess")
         offload_to_cpu_for_low_vram(pipeline)
         pipeline.birefnet_model.to(device)
@@ -239,11 +386,15 @@ def main() -> None:
     print("[infer] preprocessing (BiRefNet / crop, same as demo)")
     image_files = load_and_preprocess(paths, pipeline)
 
-    if low_vram:
+    if low_vram or vggt_gpu_ids is not None:
         pipeline.birefnet_model.cpu()
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
-        print("[infer] BiRefNet off GPU; freed memory for VGGT (11 views)")
+        print("[infer] BiRefNet off GPU; freed memory for VGGT")
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     sparse_structure_sampler_params = {
         "steps": args.ss_steps,
