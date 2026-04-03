@@ -6,6 +6,7 @@ import numpy as np
 from torchvision import transforms
 from PIL import Image
 import trimesh
+import gc
 import os
 import random
 import trellis.modules.sparse as sp
@@ -1068,6 +1069,7 @@ class TrellisVGGTTo3DPipeline(TrellisImageTo3DPipeline):
         if self.low_vram:
             decoder.cpu()
             torch.cuda.empty_cache()
+        del ss_latent
 
         # cond = {
         #     'cond': image_cond.reshape(n, -1, 1024),
@@ -1079,6 +1081,18 @@ class TrellisVGGTTo3DPipeline(TrellisImageTo3DPipeline):
         with torch.no_grad():
             slat_cond = self.get_slat_cond(image_cond, aggregated_tokens_list, num_samples)
         slat = self.sample_slat(slat_cond, coords, slat_sampler_params)
+        del slat_cond
+        del image_cond
+        del aggregated_tokens_list
+        # Multi-GPU VGGT leaves shards on cuda:0,1,2; mesh decode needs VRAM on cuda:0 — offload VGGT before decode_slat.
+        if getattr(self, '_vggt_multi_gpu', False):
+            try:
+                self.VGGT_model.cpu()
+            except Exception:
+                pass
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return self.decode_slat(slat, formats), coords, ss_noise
 
     def run_refine(
