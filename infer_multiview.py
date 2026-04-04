@@ -1,27 +1,48 @@
 #!/usr/bin/env python3
 """
-Multi-view 3D reconstruction without Gradio.
+Multi-view 3D reconstruction without Gradio (ReconViaGen / Trellis+VGGT).
 
-Loads N view images (e.g. 11), runs TrellisVGGTTo3DPipeline, writes mesh as GLB
-and optionally Gaussian splats as PLY.
+Paper (arXiv:2510.23306, ReconViaGen): https://arxiv.org/abs/2510.23306
 
-Example:
-  python infer_multiview.py --images view_00.png view_01.png ... view_10.png --out_dir ./out_run1
+What the *full* pipeline does (this repo, same idea as ``app.py``):
+  1) **Preprocess** each view (BiRefNet matting + crop/pad to 518² when no alpha).
+  2) **VGGT aggregator** on the view stack → multi-view token features (global attention over
+     all views × patches; this is the VRAM-heavy step for many views).
+  3) **DINOv2** image encoder → per-view patch tokens as additional conditioning.
+  4) **Sparse-structure flow** (3D diffusion): sample an occupancy / coordinate field conditioned
+     on VGGT + image tokens → voxel coordinates.
+  5) **SLAT flow** (structured latent diffusion) on those coords, still conditioned on the same
+     features → decode to **mesh** and optionally **3D Gaussians**.
+  6) **GLB export**: simplify mesh, optional nvdiffrast hole culling, xatlas UVs, render Gaussians
+     from many views to **bake** a texture (data-heavy generative appearance path).
 
+The paper argues that pure reconstruction fails under sparse views/occlusion, and that *generative*
+3D diffusion priors help complete invisible regions—but need better cross-view conditioning and
+controlled detail. This codebase instantiates that as Trellis-style sparse + SLAT diffusion with
+VGGT-based global multi-view tokens.
+
+---------------------------------------------------------------------------
+**Research baseline** (lighter VRAM, fewer learned appearance stages):
+
+  python infer_multiview.py --research_baseline --views_root .../foreground_images --out_dir ./out \\
+      --use_all_views
+  # or multi-GPU:  ...  --vggt_gpus 0,1,2 --use_all_views
+
+This turns on: fewer diffusion steps, **mesh-only** SLAT decode (no Gaussian head), **no** texture
+bake (geometry GLB with simple vertex colors), and drops **DreamSim** weights (unused in standard
+feed-forward ``sample_slat``—only needed for optional optimization paths). VGGT + Trellis + DINOv2
++ BiRefNet remain; replace or prune those in your own work.
+
+Examples (full demo-style export):
+  python infer_multiview.py --images view_00.png ... --out_dir ./out_run1
   python infer_multiview.py --image_dir ./my_views --out_dir ./out_run1
-  # (all .png/.jpg/.jpeg/.webp in the folder, sorted by filename)
+  python infer_multiview.py --views_root /path/to/views --out_dir ./out_cube
+  # expects .../01/000000.jpg, .../02/000000.jpg, ...
 
-  python infer_multiview.py --views_root /mnt/yubo/obj/cube/images --out_dir ./out_cube
-  # expects .../images/01/000000.jpg, .../02/000000.jpg, ... (one frame per view subfolder)
+  VGGT attention scales with view count; on ~11GB GPUs use --max_views or --use_all_views /
+  --vggt_gpus 0,1,2 (Accelerate) for 11 views.
 
-  VGGT global attention scales with the number of views; on ~11GB GPUs use fewer views or
-  --max_views 6 (or rely on automatic subsampling). See --use_all_views for full 11+.
-
-  All views on multiple GPUs (shard VGGT.aggregator):
-  pip install accelerate
-  python infer_multiview.py --vggt_gpus 0,1,2 --views_root ... --out_dir ...
-
-  On Turing/Pascal, nvdiffrast mesh hole-fill is skipped by default (CUDA error 209); use --fill_holes to try.
+  On Turing/Pascal, nvdiffrast hole-fill defaults off; use --fill_holes to try (Ampere+ defaults on).
 """
 from __future__ import annotations
 
@@ -331,6 +352,26 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    p.add_argument(
+        "--research_baseline",
+        action="store_true",
+        help=(
+            "Low-VRAM preset for a minimal generative mesh baseline: ss_steps=20, slat_steps=8, "
+            "mesh-only decode, geometry-only GLB (no Gaussian / no texture bake), drop DreamSim weights. "
+            "Override step counts by not using this flag and setting --mesh_only / --drop_dreamsim yourself."
+        ),
+    )
+    p.add_argument(
+        "--mesh_only",
+        action="store_true",
+        help="Decode SLAT to mesh only (skip Gaussian decoder; saves VRAM). Export uses geometry-only GLB.",
+    )
+    p.add_argument(
+        "--drop_dreamsim",
+        action="store_true",
+        help="Delete DreamSim after load; it is not used in standard feed-forward inference (saves CPU RAM).",
+    )
+
     return p.parse_args()
 
 
@@ -342,6 +383,22 @@ def _parse_vggt_gpu_ids(s: str | None) -> list[int] | None:
 
 def main() -> None:
     args = parse_args()
+    if args.research_baseline:
+        print(
+            "[infer] research_baseline: ss_steps=20 slat_steps=8 | mesh_only decode | "
+            "geometry-only GLB (no texture bake) | drop_dreamsim",
+            flush=True,
+        )
+        args.ss_steps = 20
+        args.slat_steps = 8
+        args.mesh_only = True
+        args.drop_dreamsim = True
+        args.save_ply = False
+
+    if args.mesh_only and args.save_ply:
+        print("[infer] ignoring --save_ply (--mesh_only: no Gaussian decode)", flush=True)
+        args.save_ply = False
+
     low_vram = not args.no_low_vram
     vggt_gpu_ids = _parse_vggt_gpu_ids(args.vggt_gpus)
 
@@ -398,10 +455,17 @@ def main() -> None:
     pipeline._device = device
     pipeline.low_vram = low_vram
 
+    if args.drop_dreamsim and getattr(pipeline, "dreamsim_model", None) is not None:
+        print("[infer] dropping DreamSim weights (unused in feed-forward sample_slat path)", flush=True)
+        del pipeline.dreamsim_model
+        pipeline.dreamsim_model = None
+        gc.collect()
+
     if vggt_gpu_ids is not None:
         print(
-            "[infer] multi-GPU VGGT: Trellis/DreamSim on CPU; BiRefNet on GPU for preprocess only; "
-            "VGGT.aggregator sharded via Accelerate",
+            "[infer] multi-GPU VGGT: Trellis on CPU"
+            + ("" if args.drop_dreamsim else "; DreamSim on CPU")
+            + "; BiRefNet on GPU for preprocess only; VGGT.aggregator sharded via Accelerate",
             flush=True,
         )
         if args.no_low_vram:
@@ -410,15 +474,21 @@ def main() -> None:
         dispatch_vggt_aggregator_sharded(pipeline, vggt_gpu_ids)
         pipeline.birefnet_model.to(device)
     elif low_vram:
-        print("[infer] low VRAM: moving Trellis / VGGT / DreamSim / BiRefNet off GPU, then BiRefNet only for preprocess")
+        print(
+            "[infer] low VRAM: moving Trellis / VGGT / BiRefNet off GPU"
+            + ("" if args.drop_dreamsim else " / DreamSim")
+            + ", then BiRefNet only for preprocess",
+            flush=True,
+        )
         offload_to_cpu_for_low_vram(pipeline)
         pipeline.birefnet_model.to(device)
     else:
         for model in pipeline.models.values():
             model.to(device)
         pipeline.VGGT_model.to(device)
-        if getattr(pipeline, "dreamsim_model", None) is not None:
-            pipeline.dreamsim_model.to(device)
+        dm = getattr(pipeline, "dreamsim_model", None)
+        if dm is not None:
+            dm.to(device)
         pipeline.birefnet_model.to(device)
 
     print("[infer] preprocessing (BiRefNet / crop, same as demo)")
@@ -449,26 +519,30 @@ def main() -> None:
         "rescale_t": args.slat_rescale_t,
     }
 
-    print("[infer] sampling …")
+    decode_formats = ["mesh"] if args.mesh_only else ["gaussian", "mesh"]
+    print(f"[infer] sampling … (decode: {decode_formats})", flush=True)
     outputs, _, _ = pipeline.run(
         image=image_files,
         seed=args.seed,
-        formats=["gaussian", "mesh"],
+        formats=decode_formats,
         preprocess_image=False,
         sparse_structure_sampler_params=sparse_structure_sampler_params,
         slat_sampler_params=slat_sampler_params,
         mode=args.mode,
     )
 
-    gs = outputs["gaussian"][0]
     mesh = outputs["mesh"][0]
+    gs = None if args.mesh_only else outputs["gaussian"][0]
     del outputs
     if torch.cuda.is_available():
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
     glb_path = out_dir / "mesh.glb"
-    print(f"[infer] exporting GLB -> {glb_path}")
+    print(
+        f"[infer] exporting {'geometry-only' if args.mesh_only else 'textured'} GLB -> {glb_path}",
+        flush=True,
+    )
     if args.no_fill_holes and args.fill_holes:
         print("[infer] both --fill_holes and --no_fill_holes set; honoring --no_fill_holes", flush=True)
     dev_idx = args.cuda_device if args.cuda_device is not None else torch.cuda.current_device()
@@ -486,6 +560,13 @@ def main() -> None:
         )
 
     def _export_glb(fill_holes: bool):
+        if args.mesh_only:
+            return postprocessing_utils.to_glb_geometry_only(
+                mesh,
+                simplify=args.mesh_simplify,
+                fill_holes=fill_holes,
+                verbose=True,
+            )
         return postprocessing_utils.to_glb(
             gs,
             mesh,
@@ -521,6 +602,7 @@ def main() -> None:
     glb.export(str(glb_path))
 
     if args.save_ply:
+        assert gs is not None
         ply_path = out_dir / "gaussian.ply"
         print(f"[infer] exporting PLY -> {ply_path}")
         gs.save_ply(str(ply_path))

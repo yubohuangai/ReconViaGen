@@ -494,6 +494,42 @@ def to_glb(
     return mesh
 
 
+def to_glb_geometry_only(
+    mesh: MeshExtractResult,
+    simplify: float = 0.95,
+    fill_holes: bool = True,
+    fill_holes_max_size: float = 0.04,
+    debug: bool = False,
+    verbose: bool = True,
+) -> trimesh.Trimesh:
+    """
+    Minimal GLB export: same mesh postprocess as ``to_glb``, but **no** UV unwrap, Gaussian renders,
+    or texture bake. Vertex colors are a simple bbox-normalized RGB encoding for visualization.
+
+    Intended as a low-VRAM baseline for research forks (replace with your own appearance model).
+    """
+    vertices = mesh.vertices.cpu().numpy()
+    faces = mesh.faces.cpu().numpy()
+    vertices, faces = postprocess_mesh(
+        vertices,
+        faces,
+        simplify=simplify > 0,
+        simplify_ratio=simplify,
+        fill_holes=fill_holes,
+        fill_holes_max_hole_size=fill_holes_max_size,
+        fill_holes_max_hole_nbe=int(250 * np.sqrt(1 - simplify)),
+        fill_holes_resolution=1024,
+        fill_holes_num_views=1000,
+        debug=debug,
+        verbose=verbose,
+    )
+    vertices = vertices @ np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
+    lo, hi = vertices.min(0), vertices.max(0)
+    span = np.maximum(hi - lo, 1e-8)
+    vertex_colors = ((vertices - lo) / span * 255).astype(np.uint8)
+    return trimesh.Trimesh(vertices, faces, vertex_colors=vertex_colors, process=False)
+
+
 def simplify_gs(
     gs: Gaussian,
     simplify: float = 0.95,
