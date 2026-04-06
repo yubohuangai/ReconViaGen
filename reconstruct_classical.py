@@ -8,8 +8,10 @@ Example
 -------
     python reconstruct_classical.py \\
         --data_root /path/to/data \\
-        --output_dir outputs/classical \\
         --device cuda:0
+
+    Writes ``<data_root>/reconstruction/mesh.glb`` by default; expects
+    masks under ``<data_root>/masks/<cam>/`` unless ``--no_masks``.
 """
 
 import argparse
@@ -22,13 +24,18 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="Classical MVS reconstruction from calibrated multi-view images.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        epilog=(
+            "Defaults: output <data_root>/reconstruction; masks from <data_root>/masks "
+            "(subdir name overridable with --masks; disable with --no_masks)."
+        ),
     )
 
     # I/O
     p.add_argument("--data_root", required=True,
                     help="Directory containing images/<cam>/ + intri.yml + extri.yml")
-    p.add_argument("--output_dir", default="outputs/classical",
-                    help="Where to write mesh and optional depth maps")
+    p.add_argument("--output_dir", default=None,
+                    help="Where to write mesh and optional depth maps. "
+                         "Default: <data_root>/reconstruction (not the repo cwd)")
     p.add_argument("--frame", type=int, default=0,
                     help="Frame index (selects {frame:06d}{ext} per camera)")
     p.add_argument("--ext", default=".jpg",
@@ -37,8 +44,10 @@ def parse_args():
                     help="Intrinsics file name (relative to data_root)")
     p.add_argument("--extri", default="extri.yml",
                     help="Extrinsics file name (relative to data_root)")
-    p.add_argument("--masks", default=None,
-                    help="Mask subdirectory name under data_root (e.g. 'masks')")
+    p.add_argument("--masks", default="masks",
+                    help="Mask subdirectory under data_root (default: masks → data_root/masks)")
+    p.add_argument("--no_masks", action="store_true",
+                    help="Do not load or apply foreground masks")
     p.add_argument("--format", choices=["glb", "obj"], default="glb",
                     help="Output mesh format")
 
@@ -94,7 +103,12 @@ def main():
     import cv2
     import numpy as np
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    output_dir = (
+        args.output_dir
+        if args.output_dir is not None
+        else join(args.data_root, "reconstruction")
+    )
+    os.makedirs(output_dir, exist_ok=True)
     t0 = time.time()
 
     # ------------------------------------------------------------------
@@ -110,6 +124,7 @@ def main():
 
     cams, cam_names = read_cameras(intri_path, extri_path)
     print(f"[main] {len(cam_names)} cameras: {cam_names}")
+    print(f"[main] Output directory: {output_dir}")
 
     # ------------------------------------------------------------------
     # 2.  Load images (+ optional masks)
@@ -118,11 +133,17 @@ def main():
     images = load_images(args.data_root, cam_names, frame=args.frame, ext=args.ext)
 
     masks = None
-    if args.masks:
+    if not args.no_masks:
+        mask_root = join(args.data_root, args.masks)
         masks = load_masks(args.data_root, cam_names, mask_dir=args.masks,
                            frame=args.frame)
         if masks:
-            print(f"[main] Loaded masks from {args.masks}/")
+            print(f"[main] Loaded masks from {mask_root}/")
+        else:
+            print(
+                f"[main] No masks found at {mask_root}/ — "
+                "continuing without masks (use Motion-Capture masks or --no_masks to silence)"
+            )
 
     # Undistort
     if args.undistort:
@@ -161,7 +182,7 @@ def main():
     )
 
     if args.save_depths:
-        depth_dir = join(args.output_dir, "depth_maps")
+        depth_dir = join(output_dir, "depth_maps")
         os.makedirs(depth_dir, exist_ok=True)
         for name in cam_names:
             np.save(join(depth_dir, f"{name}.npy"), depth_maps[name])
@@ -206,7 +227,7 @@ def main():
             texture_size=args.texture_size, masks=masks,
         )
         # Save the texture image separately for OBJ format
-        tex_path = join(args.output_dir, "texture.png")
+        tex_path = join(output_dir, "texture.png")
         cv2.imwrite(tex_path, tex_img[:, :, ::-1])
         print(f"[main] Saved texture to {tex_path}")
 
@@ -214,10 +235,10 @@ def main():
     # 7.  Export
     # ------------------------------------------------------------------
     if args.format == "glb":
-        out_path = join(args.output_dir, "mesh.glb")
+        out_path = join(output_dir, "mesh.glb")
         mesh.export(out_path)
     else:
-        out_path = join(args.output_dir, "mesh.obj")
+        out_path = join(output_dir, "mesh.obj")
         mesh.export(out_path)
 
     elapsed = time.time() - t0
