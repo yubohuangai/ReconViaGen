@@ -10,8 +10,9 @@ Example
         --data_root /path/to/data \\
         --device cuda:0
 
-    Writes ``<data_root>/reconstruction/mesh.glb`` by default; expects
-    masks under ``<data_root>/masks/<cam>/`` unless ``--no_masks``.
+    Writes ``<data_root>/reconstruction/mesh.glb`` by default. **Foreground
+    masks are required** under ``<data_root>/masks/<cam>/`` (see Motion-Capture
+    ``generate_masks.py``).
 """
 
 import argparse
@@ -25,8 +26,8 @@ def parse_args():
         description="Classical MVS reconstruction from calibrated multi-view images.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         epilog=(
-            "Defaults: output <data_root>/reconstruction; masks from <data_root>/masks "
-            "(subdir name overridable with --masks; disable with --no_masks)."
+            "Foreground masks are required under <data_root>/<masks>/<cam>/ "
+            "(default subdir name: masks). Override path with --masks."
         ),
     )
 
@@ -45,9 +46,7 @@ def parse_args():
     p.add_argument("--extri", default="extri.yml",
                     help="Extrinsics file name (relative to data_root)")
     p.add_argument("--masks", default="masks",
-                    help="Mask subdirectory under data_root (default: masks → data_root/masks)")
-    p.add_argument("--no_masks", action="store_true",
-                    help="Do not load or apply foreground masks")
+                    help="Mask subdirectory under data_root (required; default: masks)")
     p.add_argument("--format", choices=["glb", "obj"], default="glb",
                     help="Output mesh format")
 
@@ -127,23 +126,21 @@ def main():
     print(f"[main] Output directory: {output_dir}")
 
     # ------------------------------------------------------------------
-    # 2.  Load images (+ optional masks)
+    # 2.  Load images and required foreground masks
     # ------------------------------------------------------------------
     print("[main] Loading images …")
     images = load_images(args.data_root, cam_names, frame=args.frame, ext=args.ext)
 
-    masks = None
-    if not args.no_masks:
-        mask_root = join(args.data_root, args.masks)
-        masks = load_masks(args.data_root, cam_names, mask_dir=args.masks,
-                           frame=args.frame)
-        if masks:
-            print(f"[main] Loaded masks from {mask_root}/")
-        else:
-            print(
-                f"[main] No masks found at {mask_root}/ — "
-                "continuing without masks (use Motion-Capture masks or --no_masks to silence)"
-            )
+    mask_root = join(args.data_root, args.masks)
+    print(f"[main] Loading masks from {mask_root}/ …")
+    masks = load_masks(
+        args.data_root,
+        cam_names,
+        mask_dir=args.masks,
+        frame=args.frame,
+        required=True,
+    )
+    print(f"[main] Loaded masks for {len(cam_names)} views")
 
     # Undistort
     if args.undistort:

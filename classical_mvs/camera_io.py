@@ -189,10 +189,22 @@ def load_masks(
     mask_dir: str = "masks",
     frame: int = 0,
     ext: str = ".png",
+    *,
+    required: bool = False,
 ) -> Optional[Dict[str, np.ndarray]]:
-    """Load optional foreground masks.  Returns *None* if the mask dir doesn't exist."""
+    """Load foreground masks from ``<data_root>/<mask_dir>/<cam>/``.
+
+    If *required* is False and the mask directory is missing, returns *None*.
+    If *required* is True, raises ``FileNotFoundError`` / ``IOError`` when
+    the directory or any per-camera mask file is missing or unreadable.
+    """
     mask_root = join(data_root, mask_dir)
     if not os.path.isdir(mask_root):
+        if required:
+            raise FileNotFoundError(
+                f"Mask directory required but not found: {mask_root}\n"
+                "Run Motion-Capture apps/reconstruction/generate_masks.py first."
+            )
         return None
     masks: Dict[str, np.ndarray] = {}
     for cam in cam_names:
@@ -204,8 +216,23 @@ def load_masks(
             candidates = sorted(glob(join(cam_dir, f"*{ext}")))
             if not candidates:
                 masks[cam] = None
+                if required:
+                    raise FileNotFoundError(
+                        f"Required mask missing for camera {cam}: no {ext} under {cam_dir}"
+                    )
                 continue
             path = candidates[min(frame, len(candidates) - 1)]
         m = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-        masks[cam] = m
+        if m is None:
+            if required:
+                raise OSError(f"Failed to read mask image: {path}")
+            masks[cam] = None
+        else:
+            masks[cam] = m
+    if required:
+        missing = [c for c in cam_names if masks.get(c) is None]
+        if missing:
+            raise FileNotFoundError(
+                f"Required masks missing for cameras: {missing} under {mask_root}"
+            )
     return masks
