@@ -1,0 +1,27 @@
+---
+description: GPU dev server and CUDA context for ReconViaGen (Amax41)
+alwaysApply: true
+---
+
+# ReconViaGen dev server (Amax41)
+
+When suggesting remote commands, deployment, or GPU/CUDA assumptions for this project, use this environment unless the user says otherwise.
+
+## Access and paths
+
+- **SSH**: `ssh yubo@142.244.63.41` (host also referenced as **Amax41**)
+- **Project on server**: `/mnt/yubo/github/ReconViaGen`
+- **Conda env**: `reconviagen` (activate before Python/GPU work on the server)
+
+## Hardware and software
+
+- **OS**: Ubuntu Linux, kernel 5.15.x, x86_64
+- **GPUs**: 3× NVIDIA GeForce RTX 2080 Ti (~11 GiB VRAM each)
+- **CUDA toolchain**: `nvcc` release **12.8** (CUDA 12.8.x)
+- **Driver / runtime**: NVIDIA driver **590.x**; `nvidia-smi` reports **CUDA 13.1** as the supported driver/runtime ceiling
+
+Prefer CUDA 12.x–aligned stacks when specifying install commands for this machine; verify against the above if versions conflict.
+
+## Human-readable source
+
+The user maintains a fuller snapshot (e.g. `nvidia-smi` output) in their Obsidian vault note *Server yubo@142.244.63.41*. Update this rule if the server changes.

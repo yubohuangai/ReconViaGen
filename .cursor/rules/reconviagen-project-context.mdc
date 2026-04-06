@@ -1,0 +1,29 @@
+---
+description: ReconViaGen repo layout, related Motion-Capture work, and reconstruction goals
+alwaysApply: true
+---
+
+# ReconViaGen repository context
+
+- This repo implements the **ReconViaGen** paper (multi-view 3D object reconstruction).
+- **Paper (local PDF)**: `outputs/RECONVIAGEN- TOWARDS ACCURATE MULTI-VIEW 3D OBJECT RECONSTRUCTION VIA GENERATION.pdf` — use or @-mention when you need paper details; do not paste the whole PDF into rules.
+- **`app.py`**: Gradio (or similar) **inference demo** aligned with the paper pipeline.
+- **`infer_multiview.py`**: User-authored **simplified inference** script; produces **good geometry mesh**, **no texture** for now.
+
+# Related codebase (Motion-Capture)
+
+- Active development: **`/Users/yubo/github/Motion-Capture/apps/reconstruction`** (COLMAP-style sparse recon, 3D Gaussian outputs). User finds sparse / incomplete point clouds **unsatisfactory** compared to ReconViaGen-style outputs.
+
+# Reference codebase (classical multi-view / registration)
+
+- **`/Users/yubo/github/3D_Object_Reconstruction`** — course-style **RGB-D multi-view** reconstruction: alignment, depth → point cloud, preprocessing (`preprocess_pcd.py`), **feature-based** initial alignment (`SIFT.py`, `ORB.py`, `LoFTR.py`), **ICP refinement**, **pose graph optimization** (`pose_graph_ICP.py`, `pose_graph_Feature_based.py`), Open3D utilities (`registration.py`, `utils.py`). See **`README.md`** for pipeline narrative.
+- **Note**: That repo assumes **RGB-D** and RealSense-style intrinsics; this user’s main setup is **11 RGB views + known extrinsics/intrinsics** (Motion-Capture). Still **reuse ideas and code patterns** (ICP, pose graphs, outlier handling, fusion) where they apply; adapt I/O rather than copying RealSense capture paths blindly.
+
+# Reconstruction goals (when helping with multiview / integration)
+
+- **Input**: **11** calibrated views; **camera parameters are known** — parameter format lives under the Motion-Capture repo (inspect that tree when implementing I/O).
+- **Preference**: Favor **classical / optimization / multi-view geometry** approaches over **heavy data-driven priors** when the user does not ask otherwise.
+- **Target output**: **ReconViaGen-like** deliverables — **triangle mesh geometry**, and **texture** if feasible.
+- **Constraint**: Stock ReconViaGen demos often assume **images without explicit extrinsic/intrinsic inputs**; this user’s strength is **known cameras** — designs should **exploit** that (e.g. warping, fusion, or constrained fitting) rather than ignoring it.
+
+When work spans **ReconViaGen**, **Motion-Capture**, and/or **3D_Object_Reconstruction**, say which workspace files are being edited and keep camera I/O consistent with Motion-Capture conventions.
